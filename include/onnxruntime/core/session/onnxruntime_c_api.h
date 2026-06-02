@@ -38,7 +38,7 @@
  *
  * This value is used by some API functions to behave as this version of the header expects.
  */
-#define ORT_API_VERSION 28
+#define ORT_API_VERSION 27
 
 #ifdef __cplusplus
 extern "C" {
@@ -7535,6 +7535,11 @@ struct OrtApi {
    *
    * \param[in] session The OrtSession instance.
    * \param[in] graph_annotation_id The annotation ID of the captured graph to release.
+   *
+   * \snippet{doc} snippets.dox OrtStatus Return Value
+   *
+   * \since Version 1.27.
+   */
   ORT_API2_STATUS(SessionReleaseCapturedGraph, _In_ OrtSession* session, _In_ int graph_annotation_id);
 
   /** \brief Registers a callback to provide EPContext binary data during session load.
@@ -7552,7 +7557,7 @@ struct OrtApi {
    *
    * \snippet{doc} snippets.dox OrtStatus Return Value
    *
-   * \since Version 1.28.
+   * \since Version 1.27.
    */
   ORT_API2_STATUS(SessionOptions_SetEpContextDataReadFunc, _Inout_ OrtSessionOptions* options,
                   _In_ OrtReadEpContextDataFunc read_func, _In_opt_ void* state);
@@ -8391,9 +8396,9 @@ struct OrtCompileApi {
    * \param[in] write_func The OrtWriteEpContextDataFunc called to write EPContext bytes.
    * \param[in] state Opaque state passed to write_func. Can be NULL.
    *
-   * \snippet{doc} snippets.dox OrtStatus Return Value
-   *
-   * \since Version 1.28.
+  * \snippet{doc} snippets.dox OrtStatus Return Value
+  *
+  * \since Version 1.27.
    */
   ORT_API2_STATUS(ModelCompilationOptions_SetEpContextDataWriteFunc,
                   _In_ OrtModelCompilationOptions* model_compile_options,
