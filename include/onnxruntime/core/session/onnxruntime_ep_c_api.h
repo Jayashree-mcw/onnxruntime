@@ -2092,9 +2092,9 @@ struct OrtEpApi {
    * \param[in] session_options The OrtSessionOptions instance.
    * \param[out] config The extracted OrtEpContextConfig.
    *
-  * \snippet{doc} snippets.dox OrtStatus Return Value
-  *
-  * \since Version 1.27.
+   * \snippet{doc} snippets.dox OrtStatus Return Value
+   *
+   * \since Version 1.27.
    */
   ORT_API2_STATUS(SessionOptions_GetEpContextConfig,
                   _In_ const OrtSessionOptions* session_options,
@@ -2102,9 +2102,9 @@ struct OrtEpApi {
 
   /** \brief Release an OrtEpContextConfig instance.
    *
-  * \param[in] input The OrtEpContextConfig instance to release. May be NULL.
-  *
-  * \since Version 1.27.
+   * \param[in] input The OrtEpContextConfig instance to release. May be NULL.
+   *
+   * \since Version 1.27.
    */
   ORT_CLASS_RELEASE(EpContextConfig);
 
@@ -2119,9 +2119,9 @@ struct OrtEpApi {
    * \param[out] read_func The registered read callback, or NULL if none was registered.
    * \param[out] state Opaque state pointer passed to read_func, or NULL if none was registered.
    *
-  * \snippet{doc} snippets.dox OrtStatus Return Value
-  *
-  * \since Version 1.27.
+   * \snippet{doc} snippets.dox OrtStatus Return Value
+   *
+   * \since Version 1.27.
    */
   ORT_API2_STATUS(EpContextConfig_GetEpContextDataReadFunc,
                   _In_ const OrtEpContextConfig* config,
@@ -2139,9 +2139,9 @@ struct OrtEpApi {
    * \param[out] write_func The registered write callback, or NULL if none was registered.
    * \param[out] state Opaque state pointer passed to write_func, or NULL if none was registered.
    *
-  * \snippet{doc} snippets.dox OrtStatus Return Value
-  *
-  * \since Version 1.27.
+   * \snippet{doc} snippets.dox OrtStatus Return Value
+   *
+   * \since Version 1.27.
    */
   ORT_API2_STATUS(EpContextConfig_GetEpContextDataWriteFunc,
                   _In_ const OrtEpContextConfig* config,

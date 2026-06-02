@@ -8396,9 +8396,9 @@ struct OrtCompileApi {
    * \param[in] write_func The OrtWriteEpContextDataFunc called to write EPContext bytes.
    * \param[in] state Opaque state passed to write_func. Can be NULL.
    *
-  * \snippet{doc} snippets.dox OrtStatus Return Value
-  *
-  * \since Version 1.27.
+   * \snippet{doc} snippets.dox OrtStatus Return Value
+   *
+   * \since Version 1.27.
    */
   ORT_API2_STATUS(ModelCompilationOptions_SetEpContextDataWriteFunc,
                   _In_ OrtModelCompilationOptions* model_compile_options,
