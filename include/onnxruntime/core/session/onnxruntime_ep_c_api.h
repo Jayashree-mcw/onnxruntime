@@ -2094,7 +2094,7 @@ struct OrtEpApi {
    *
    * \snippet{doc} snippets.dox OrtStatus Return Value
    *
-   * \since Version 1.27.
+   * \since Version 1.28.
    */
   ORT_API2_STATUS(SessionOptions_GetEpContextConfig,
                   _In_ const OrtSessionOptions* session_options,
@@ -2104,7 +2104,7 @@ struct OrtEpApi {
    *
    * \param[in] input The OrtEpContextConfig instance to release. May be NULL.
    *
-   * \since Version 1.27.
+   * \since Version 1.28.
    */
   ORT_CLASS_RELEASE(EpContextConfig);
 
@@ -2121,7 +2121,7 @@ struct OrtEpApi {
    *
    * \snippet{doc} snippets.dox OrtStatus Return Value
    *
-   * \since Version 1.27.
+   * \since Version 1.28.
    */
   ORT_API2_STATUS(EpContextConfig_GetEpContextDataReadFunc,
                   _In_ const OrtEpContextConfig* config,
@@ -2141,7 +2141,7 @@ struct OrtEpApi {
    *
    * \snippet{doc} snippets.dox OrtStatus Return Value
    *
-   * \since Version 1.27.
+   * \since Version 1.28.
    */
   ORT_API2_STATUS(EpContextConfig_GetEpContextDataWriteFunc,
                   _In_ const OrtEpContextConfig* config,
