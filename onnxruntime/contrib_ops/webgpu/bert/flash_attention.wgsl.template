@@ -73,6 +73,31 @@ fn loadq(batch_idx : u32, q_idx_global : u32, head_idx : u32, alpha : q_element_
 var<private> qk_scores : array<q_element_t, max_k_step>;
 
 fn loadk(k_start : u32, batch_head_idx : u32, local_idx : u32) {
+#if turbo_quant
+  // TurboQuant: KV cache is u32-packed (norm + 4-bit indices). Dequantize on load.
+  // Parallelize across slots; each lane dequantizes one full row (head_size_vec vec4s).
+  let kv_head_idx = batch_head_idx / uniforms.n_reps;
+  let total_seq = get_total_sequence_length();
+  for (var slot : u32 = local_idx; slot < max_k_step; slot += workgroup_size_x) {
+    let seq_idx = k_start + slot;
+    if (seq_idx < total_seq) {
+      let base = kv_head_idx * uniforms.present_sequence_length * COMPRESSED_HEAD_U32 + seq_idx * COMPRESSED_HEAD_U32;
+      let norm = bitcast<f32>(present_key[base]);
+      for (var v : u32 = 0u; v < head_size_vec; v++) {
+        let elem_base = v * 4u;
+        let c0 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 0u)] * norm;
+        let c1 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 1u)] * norm;
+        let c2 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 2u)] * norm;
+        let c3 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 3u)] * norm;
+        k_tile[slot][v] = q_value_t(q_element_t(c0), q_element_t(c1), q_element_t(c2), q_element_t(c3));
+      }
+    } else {
+      for (var v : u32 = 0u; v < head_size_vec; v++) {
+        k_tile[slot][v] = q_value_t(0);
+      }
+    }
+  }
+#else
   let offset = batch_head_idx / uniforms.n_reps * uniforms.present_sequence_length * head_size_vec +
                k_start * head_size_vec;
   let total_seq = get_total_sequence_length();
@@ -80,9 +105,34 @@ fn loadk(k_start : u32, batch_head_idx : u32, local_idx : u32) {
     let slot = u32(idx / head_size_vec);
     k_tile[slot][idx % head_size_vec] = select(q_value_t(0), present_key[offset + idx], k_start + slot < total_seq);
   }
+#endif
 }
 
 fn loadv(v_start : u32, batch_head_idx : u32, local_idx : u32) {
+#if turbo_quant
+  // TurboQuant: KV cache is u32-packed (norm + 4-bit indices). Dequantize on load.
+  let kv_head_idx = batch_head_idx / uniforms.n_reps;
+  let total_seq = get_total_sequence_length();
+  for (var slot : u32 = local_idx; slot < max_k_step; slot += workgroup_size_x) {
+    let seq_idx = v_start + slot;
+    if (seq_idx < total_seq) {
+      let base = kv_head_idx * uniforms.present_sequence_length * COMPRESSED_HEAD_U32 + seq_idx * COMPRESSED_HEAD_U32;
+      let norm = bitcast<f32>(present_value[base]);
+      for (var v : u32 = 0u; v < head_size_vec; v++) {
+        let elem_base = v * 4u;
+        let c0 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 0u)] * norm;
+        let c1 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 1u)] * norm;
+        let c2 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 2u)] * norm;
+        let c3 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 3u)] * norm;
+        v_tile[slot][v] = q_value_t(q_element_t(c0), q_element_t(c1), q_element_t(c2), q_element_t(c3));
+      }
+    } else {
+      for (var v : u32 = 0u; v < head_size_vec; v++) {
+        v_tile[slot][v] = q_value_t(0);
+      }
+    }
+  }
+#else
   let offset = batch_head_idx / uniforms.n_reps * uniforms.present_sequence_length * head_size_vec +
                v_start * head_size_vec;
   let total_seq = get_total_sequence_length();
@@ -90,6 +140,7 @@ fn loadv(v_start : u32, batch_head_idx : u32, local_idx : u32) {
     let slot = u32(idx / head_size_vec);
     v_tile[slot][idx % head_size_vec] = select(q_value_t(0), present_value[offset + idx], v_start + slot < total_seq);
   }
+#endif
 }
 
 var<private> o_tile : array<q_value_t, head_size_vec>;
