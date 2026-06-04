@@ -104,6 +104,13 @@ class ComputeContextBase {
   }
 
   //
+  // Get whether TurboQuant 4-bit KV cache quantization is enabled.
+  //
+  inline bool TurboQuantEnabled() const {
+    return ep_.TurboQuantEnabled();
+  }
+
+  //
   // Get the logger.
   //
   inline const logging::Logger& Logger() const {

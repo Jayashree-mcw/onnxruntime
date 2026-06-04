@@ -3,6 +3,8 @@
 
 #include "contrib_ops/cpu/bert/multihead_attention_helper.h"
 #include "contrib_ops/webgpu/bert/flash_attention.h"
+#include "contrib_ops/webgpu/bert/hadamard_transform.h"
+#include "contrib_ops/webgpu/bert/turbo_quant_hadamard.h"
 #include "contrib_ops/webgpu/webgpu_contrib_kernels.h"
 
 #include "core/providers/webgpu/webgpu_supported_types.h"
@@ -210,6 +212,7 @@ Status FlashAttentionProgram::GenerateShaderCode(ShaderHelper& shader) const {
   shader.AddOutput("output", ShaderUsage::UseUniform);
 
   return WGSL_TEMPLATE_APPLY(shader, "bert/flash_attention.wgsl.template",
+                             WGSL_TEMPLATE_PARAMETER(compressed_head_size_u32, compressed_head_size_u32_),
                              WGSL_TEMPLATE_PARAMETER(has_attention_bias, has_attention_bias_),
                              WGSL_TEMPLATE_PARAMETER(has_head_sink, has_head_sink_),
                              WGSL_TEMPLATE_PARAMETER(is_fp16, is_fp16_),
@@ -220,13 +223,18 @@ Status FlashAttentionProgram::GenerateShaderCode(ShaderHelper& shader) const {
                              WGSL_TEMPLATE_PARAMETER(q_BNSH, q_BNSH_),
                              WGSL_TEMPLATE_PARAMETER(qkv_head_size, qkv_head_size_),
                              WGSL_TEMPLATE_PARAMETER(qkv_num_heads, qkv_num_heads_),
+                             WGSL_TEMPLATE_PARAMETER(turbo_quant, turbo_quant_),
                              WGSL_TEMPLATE_PARAMETER(use_seqlen_k, use_seqlen_k_),
                              WGSL_TEMPLATE_PARAMETER(use_shm_path, use_shm_path_));
 }
 
 Status FlashAttentionDecodeQKTProgram::GenerateShaderCode(ShaderHelper& shader) const {
   shader.AddInput("q", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
-  shader.AddInput("present_key", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
+  if (turbo_quant_) {
+    shader.AddInput("present_key", ShaderUsage::UseUniform);
+  } else {
+    shader.AddInput("present_key", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
+  }
   if (use_indirect_dispatch_) {
     shader.AddInput("seqlens_k", ShaderUsage::None);
   }
@@ -239,24 +247,28 @@ Status FlashAttentionDecodeQKTProgram::GenerateShaderCode(ShaderHelper& shader) 
   const uint32_t tile_size_k_vec = 8;
   const uint32_t sub_tile_count = WorkgroupSizeX() / tile_size_k_vec;
   return WGSL_TEMPLATE_APPLY(shader, "bert/flash_attention_decode_qkt.wgsl.template",
+                             WGSL_TEMPLATE_PARAMETER(compressed_head_size_u32, compressed_head_size_u32_),
                              WGSL_TEMPLATE_PARAMETER(has_attention_bias, has_attention_bias_),
                              WGSL_TEMPLATE_PARAMETER(sub_tile_count, sub_tile_count),
                              WGSL_TEMPLATE_PARAMETER(tile_size, tile_size_),
                              WGSL_TEMPLATE_PARAMETER(tile_size_k_vec, tile_size_k_vec),
+                             WGSL_TEMPLATE_PARAMETER(turbo_quant, turbo_quant_),
                              WGSL_TEMPLATE_PARAMETER(use_indirect_dispatch, use_indirect_dispatch_));
 }
 
 Status ComputeFlashAttentionDecodeQKT(onnxruntime::webgpu::ComputeContext& context, const Tensor* Q,
                                       const Tensor* attention_bias, Tensor* output, Tensor* present_key, Tensor* metadata, const Tensor* seqlen_k,
-                                      const WebgpuAttentionParameters& parameters, const Tensor* indirect_buffer, uint32_t num_total_seq_length_tile, uint32_t num_present_sequence_length_tile, uint32_t tile_size, bool use_indirect_dispatch, uint32_t present_sequence_length) {
+                                      const WebgpuAttentionParameters& parameters, const Tensor* indirect_buffer, uint32_t num_total_seq_length_tile, uint32_t num_present_sequence_length_tile, uint32_t tile_size, bool use_indirect_dispatch, uint32_t present_sequence_length,
+                                      bool turbo_quant, int compressed_head_size_u32) {
   const float alpha = parameters.scale_ == 0.0f ? 1.f / sqrt(static_cast<float>(parameters.head_size_))
                                                 : parameters.scale_;
 
   const bool has_attention_bias = attention_bias != nullptr;
-  const int components = 4;
+  const int components = turbo_quant ? 1 : 4;
 
-  FlashAttentionDecodeQKTProgram program{"FlashAttentionDecodeQKT", has_attention_bias, tile_size, use_indirect_dispatch};
-  program.AddInputs({{Q, ProgramTensorMetadataDependency::TypeAndRank, components},
+  FlashAttentionDecodeQKTProgram program{"FlashAttentionDecodeQKT", has_attention_bias, tile_size, use_indirect_dispatch,
+                                         turbo_quant, compressed_head_size_u32};
+  program.AddInputs({{Q, ProgramTensorMetadataDependency::TypeAndRank, 4},
                      {present_key, ProgramTensorMetadataDependency::TypeAndRank, components}});
   if (use_indirect_dispatch) {
     program.AddInput({seqlen_k, ProgramTensorMetadataDependency::None});
@@ -267,7 +279,7 @@ Status ComputeFlashAttentionDecodeQKT(onnxruntime::webgpu::ComputeContext& conte
   program.AddOutputs({{output, ProgramTensorMetadataDependency::Rank},
                       {metadata, ProgramTensorMetadataDependency::Rank, 2}});
 
-  const uint32_t vectorized_head_size = parameters.head_size_ / components;
+  const uint32_t vectorized_head_size = parameters.head_size_ / 4;  // Always vec4 for Q iteration
 
   // Get attention bias dimensions for broadcasting
   uint32_t attn_bias_dim0 = 1;
@@ -284,7 +296,7 @@ Status ComputeFlashAttentionDecodeQKT(onnxruntime::webgpu::ComputeContext& conte
     program.SetDispatchGroupSize(parameters.batch_size_ * parameters.num_heads_ * num_total_seq_length_tile);
   }
   program.SetWorkgroupSize(64)
-      .CacheHint(tile_size, has_attention_bias, use_indirect_dispatch)
+      .CacheHint(tile_size, has_attention_bias, use_indirect_dispatch, turbo_quant, compressed_head_size_u32)
       .AddUniformVariables({{static_cast<uint32_t>(vectorized_head_size)},
                             {static_cast<uint32_t>(parameters.total_sequence_length_)},
                             {static_cast<float>(alpha)},
@@ -294,7 +306,8 @@ Status ComputeFlashAttentionDecodeQKT(onnxruntime::webgpu::ComputeContext& conte
                             {static_cast<uint32_t>(parameters.num_heads_)},
                             {static_cast<uint32_t>(parameters.batch_size_)},
                             {attn_bias_dim0},
-                            {attn_bias_dim1}});
+                            {attn_bias_dim1},
+                            {static_cast<uint32_t>(compressed_head_size_u32)}});
 
   return context.RunProgram(program);
 }
@@ -302,23 +315,29 @@ Status ComputeFlashAttentionDecodeQKT(onnxruntime::webgpu::ComputeContext& conte
 Status FlashAttentionDecodeSplitVxProgram::GenerateShaderCode(ShaderHelper& shader) const {
   shader.AddInput("metadata", ShaderUsage::UseUniform);
   shader.AddInput("qk", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
-  shader.AddInput("present_value", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
+  if (turbo_quant_) {
+    shader.AddInput("present_value", ShaderUsage::UseUniform);
+  } else {
+    shader.AddInput("present_value", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
+  }
   if (use_indirect_dispatch_) {
     shader.AddInput("seqlens_k", ShaderUsage::None);
   }
   if (has_head_sink_) {
     shader.AddInput("head_sink", ShaderUsage::UseUniform);
   }
-  shader.AddOutput("out_split_vx", ShaderUsage::UseUniform);
+  shader.AddOutput("out_split_vx", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias | ShaderUsage::UseElementTypeAlias);
 
   const uint32_t tile_size_k_vec = 8u;
 
   return WGSL_TEMPLATE_APPLY(shader, "bert/flash_attention_decode_split_vx.wgsl.template",
+                             WGSL_TEMPLATE_PARAMETER(compressed_head_size_u32, compressed_head_size_u32_),
                              WGSL_TEMPLATE_PARAMETER(has_head_sink, has_head_sink_),
                              WGSL_TEMPLATE_PARAMETER(head_size_vec, head_size_vec_),
                              WGSL_TEMPLATE_PARAMETER(sub_tile_count, WorkgroupSizeX() / tile_size_k_vec),
                              WGSL_TEMPLATE_PARAMETER(tile_size, tile_size_),
                              WGSL_TEMPLATE_PARAMETER(tile_size_k_vec, tile_size_k_vec),
+                             WGSL_TEMPLATE_PARAMETER(turbo_quant, turbo_quant_),
                              WGSL_TEMPLATE_PARAMETER(use_indirect_dispatch, use_indirect_dispatch_));
 }
 
@@ -335,15 +354,17 @@ Status ComputeFlashAttentionDecodeSplitVxScore(onnxruntime::webgpu::ComputeConte
                                                uint32_t tile_size,
                                                bool use_indirect_dispatch,
                                                uint32_t present_sequence_length,
-                                               const Tensor* head_sink) {
-  const int components = 4;
+                                               const Tensor* head_sink,
+                                               bool turbo_quant, int compressed_head_size_u32) {
+  const int components = turbo_quant ? 1 : 4;
   const bool has_head_sink = head_sink != nullptr;
-  int head_size_vec = parameters.v_head_size_ / components;
-  FlashAttentionDecodeSplitVxProgram program{"FlashAttentionDecodeSplitVx", tile_size, head_size_vec, use_indirect_dispatch, has_head_sink};
+  int head_size_vec = parameters.v_head_size_ / 4;  // Always vec4 for output/computation
+  FlashAttentionDecodeSplitVxProgram program{"FlashAttentionDecodeSplitVx", tile_size, head_size_vec, use_indirect_dispatch, has_head_sink,
+                                             turbo_quant, compressed_head_size_u32};
   program.AddInputs({{metadata, ProgramTensorMetadataDependency::TypeAndRank, 2},
                      {qk, ProgramTensorMetadataDependency::TypeAndRank},
                      {present_value, ProgramTensorMetadataDependency::TypeAndRank, components}});
-  program.AddOutputs({{out_split_vx, ProgramTensorMetadataDependency::TypeAndRank, components}});  // [B, N, split_k, head_size]
+  program.AddOutputs({{out_split_vx, ProgramTensorMetadataDependency::TypeAndRank, 4}});  // [B, N, split_k, head_size]
   const uint32_t batch_heads = static_cast<uint32_t>(parameters.batch_size_ * parameters.num_heads_);
   if (use_indirect_dispatch) {
     program.AddInput({seqlen_k, ProgramTensorMetadataDependency::None});
@@ -358,7 +379,7 @@ Status ComputeFlashAttentionDecodeSplitVxScore(onnxruntime::webgpu::ComputeConte
   } else {
     program.SetDispatchGroupSize(batch_heads * num_total_seq_length_tile);
   }
-  program.CacheHint(tile_size, head_size_vec, use_indirect_dispatch, has_head_sink)
+  program.CacheHint(tile_size, head_size_vec, use_indirect_dispatch, has_head_sink, turbo_quant, compressed_head_size_u32)
       .SetWorkgroupSize(64)
       .AddUniformVariables({{static_cast<uint32_t>(parameters.total_sequence_length_)},
                             {static_cast<uint32_t>(head_size_vec)},
@@ -366,7 +387,8 @@ Status ComputeFlashAttentionDecodeSplitVxScore(onnxruntime::webgpu::ComputeConte
                             {static_cast<uint32_t>(parameters.n_reps)},
                             num_present_sequence_length_tile,
                             {batch_heads},
-                            {static_cast<uint32_t>(parameters.num_heads_)}});
+                            {static_cast<uint32_t>(parameters.num_heads_)},
+                            {static_cast<uint32_t>(compressed_head_size_u32)}});
 
   return context.RunProgram(program);
 }
@@ -445,6 +467,8 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
 
   // Declare query_output at function scope to ensure it persists throughout the function
   Tensor query_output;
+  // Declare rotated_q at function scope so the pointer remains valid
+  Tensor rotated_q;
 
   // Create indirect dispatch buffer if using indirect dispatch
   Tensor* indirect_buffer_ptr = nullptr;
@@ -460,6 +484,54 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
     const TensorShape indirect_buffer_shape{3};  // 3 uint32 values for dispatch dimensions
     indirect_buffer = context.CreateGPUTensor(DataTypeImpl::GetType<uint32_t>(), indirect_buffer_shape);
     indirect_buffer_ptr = &indirect_buffer;
+  }
+
+  // Determine if Hadamard rotation applies (head_size must be power of 2 and >= 4).
+  // Only enabled when TurboQuant is set via provider options.
+  const bool apply_hadamard = context.TurboQuantEnabled() &&
+                              (parameters.head_size_ & (parameters.head_size_ - 1)) == 0 &&
+                              parameters.head_size_ >= 4;
+
+  // Tensors to hold rotated K/V inputs (must persist through CopyKVCache).
+  Tensor rotated_k_tensor;
+  Tensor rotated_v_tensor;
+
+  // Compressed KV cache: 1 u32 for norm + head_size/8 u32s for packed 4-bit indices.
+  const int compressed_head_size_u32 = apply_hadamard ? (parameters.head_size_ / 8 + 1) : 0;
+
+  // When TurboQuant is active, create u32 tensor views over present/past KV cache buffers.
+  // GenAI allocates the KV cache with kv_cache_head_size matching compressed_head_size_u32,
+  // so the buffer already has the right byte count — we just reinterpret the element type as u32.
+  Tensor present_key_u32, present_value_u32;
+  Tensor past_key_u32, past_value_u32;
+  Tensor* tq_present_key = present_key;
+  Tensor* tq_present_value = present_value;
+  const Tensor* tq_past_key = past_key;
+  const Tensor* tq_past_value = past_value;
+  if (apply_hadamard) {
+    // present KV views: reinterpret as u32 with compressed head dim.
+    TensorShapeVector u32_present_shape({present_key->Shape()[0], present_key->Shape()[1],
+                                         present_key->Shape()[2],
+                                         static_cast<int64_t>(compressed_head_size_u32)});
+    present_key_u32 = Tensor(DataTypeImpl::GetType<uint32_t>(), TensorShape(u32_present_shape),
+                             present_key->MutableDataRaw(), present_key->Location());
+    present_value_u32 = Tensor(DataTypeImpl::GetType<uint32_t>(), TensorShape(u32_present_shape),
+                               present_value->MutableDataRaw(), present_value->Location());
+    tq_present_key = &present_key_u32;
+    tq_present_value = &present_value_u32;
+
+    // past KV views (if present).
+    if (past_key != nullptr && past_key->SizeInBytes() > 0) {
+      TensorShapeVector u32_past_shape({past_key->Shape()[0], past_key->Shape()[1],
+                                        past_key->Shape()[2],
+                                        static_cast<int64_t>(compressed_head_size_u32)});
+      past_key_u32 = Tensor(DataTypeImpl::GetType<uint32_t>(), TensorShape(u32_past_shape),
+                            const_cast<void*>(past_key->DataRaw()), past_key->Location());
+      past_value_u32 = Tensor(DataTypeImpl::GetType<uint32_t>(), TensorShape(u32_past_shape),
+                              const_cast<void*>(past_value->DataRaw()), past_value->Location());
+      tq_past_key = &past_key_u32;
+      tq_past_value = &past_value_u32;
+    }
   }
 
   const bool do_rotary = (cos_cache != nullptr && sin_cache != nullptr);
@@ -494,6 +566,18 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
                                                                       &query_output, present_key, present_value,
                                                                       indirect_buffer_ptr, tile_size));
     Q = &query_output;
+
+    // For the fused rotary path, new K/V entries are already written into the static KV cache
+    // by the fused shader. To apply Hadamard only to the new entries we'd need a strided/offset
+    // kernel since they sit at [B, N, past_seq..past_seq+kv_seq, H] inside the BNSH cache and
+    // are not globally contiguous. TODO: fuse Hadamard into the SplitPackedQKV shader, or add
+    // an offset-aware Hadamard kernel. Hadamard is skipped for the rotary path for now.
+  } else if (apply_hadamard && K != nullptr && V != nullptr) {
+    // Fused path: apply Hadamard transform to new K/V tokens while copying them into the KV cache.
+    // This replaces 3 dispatches (Hadamard K + Hadamard V + CopyKVCache) with 1 dispatch.
+    // Pass u32 tensor views for present/past KV cache (quantized output).
+    ORT_RETURN_IF_ERROR(TurboQuantCopyKVCache(context, parameters, K, tq_past_key, tq_present_key, V, tq_past_value, tq_present_value,
+                                                 tile_size, use_seqlen_k ? seqlen_k : nullptr, indirect_buffer_ptr));
   } else {
     ORT_RETURN_IF_ERROR(CopyKVCache(context, parameters, K, past_key, present_key, V, past_value, present_value, tile_size, use_seqlen_k ? seqlen_k : nullptr, indirect_buffer_ptr));
   }
@@ -502,6 +586,32 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
   // after kv_empty aliasing ensures present_key is valid:
   // (batch_size, num_heads, total_sequence_length/max_sequence_length, head_size)
   const uint32_t present_sequence_length = static_cast<uint32_t>(present_key->Shape()[2]);
+
+  // Rotate Q before attention.
+  if (apply_hadamard) {
+    rotated_q = context.CreateGPUTensor(Q->DataType(), Q->Shape());
+    if (parameters.qkv_format_ == Q_K_V_BNSH) {
+      ORT_RETURN_IF_ERROR(ApplyHadamardTransform(
+          context, Q, &rotated_q,
+          parameters.batch_size_ * parameters.num_heads_,
+          parameters.sequence_length_, 1, parameters.head_size_));
+    } else {
+      ORT_RETURN_IF_ERROR(ApplyHadamardTransform(
+          context, Q, &rotated_q,
+          parameters.batch_size_, parameters.sequence_length_,
+          parameters.num_heads_, parameters.head_size_));
+    }
+    Q = &rotated_q;
+  }
+
+  // When Hadamard is active, write attention output to a temp buffer, then
+  // inverse-Hadamard from temp → final output. This avoids an extra copy.
+  Tensor attn_output_temp;
+  Tensor* attn_output = output;
+  if (apply_hadamard) {
+    attn_output_temp = context.CreateGPUTensor(output->DataType(), output->Shape());
+    attn_output = &attn_output_temp;
+  }
 
   if (parameters.sequence_length_ > 1) {
     bool has_attention_bias = attention_bias != nullptr;
@@ -524,10 +634,15 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
                                   has_subgroups,
                                   q_BNSH,
                                   use_seqlen_k,
-                                  has_head_sink};
+                                  has_head_sink,
+                                  apply_hadamard,
+                                  compressed_head_size_u32};
+    // When TQ is active, KV cache is u32-packed — use u32 tensor views for present_key/present_value.
+    const Tensor* fa_present_key = apply_hadamard ? tq_present_key : present_key;
+    const Tensor* fa_present_value = apply_hadamard ? tq_present_value : present_value;
     program.AddInputs({{Q, ProgramTensorMetadataDependency::TypeAndRank, 4},
-                       {present_key, ProgramTensorMetadataDependency::TypeAndRank, 4},
-                       {present_value, ProgramTensorMetadataDependency::TypeAndRank, 4}});
+                       {fa_present_key, ProgramTensorMetadataDependency::TypeAndRank, apply_hadamard ? 1 : 4},
+                       {fa_present_value, ProgramTensorMetadataDependency::TypeAndRank, apply_hadamard ? 1 : 4}});
     if (has_attention_bias) {
       program.AddInputs({{attention_bias, ProgramTensorMetadataDependency::TypeAndRank}});
     }
@@ -537,7 +652,7 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
     if (has_head_sink) {
       program.AddInputs({{head_sink, ProgramTensorMetadataDependency::Type}});
     }
-    program.AddOutputs({{output, ProgramTensorMetadataDependency::TypeAndRank, 4}});
+    program.AddOutputs({{attn_output, ProgramTensorMetadataDependency::TypeAndRank, 4}});
     const float alpha = parameters.scale_ == 0.0f ? 1.f / sqrt(static_cast<float>(parameters.head_size_))
                                                   : parameters.scale_;
 
@@ -556,7 +671,7 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
 
     program.SetDispatchGroupSize(parameters.batch_size_ * parameters.num_heads_ * num_seq_tile)
         .SetWorkgroupSize(prefill_tile_size)
-        .CacheHint(has_attention_bias, parameters.head_size_, parameters.num_heads_, parameters.is_unidirectional_, is_qualcomm, is_nvidia, is_apple, has_subgroups, q_BNSH, use_seqlen_k, has_head_sink, program.max_k_step())
+        .CacheHint(has_attention_bias, parameters.head_size_, parameters.num_heads_, parameters.is_unidirectional_, is_qualcomm, is_nvidia, is_apple, has_subgroups, q_BNSH, use_seqlen_k, has_head_sink, apply_hadamard, compressed_head_size_u32, program.max_k_step())
         .AddUniformVariables({{static_cast<uint32_t>(parameters.sequence_length_)},
                               {static_cast<uint32_t>(parameters.total_sequence_length_)},
                               {static_cast<uint32_t>(present_sequence_length)},
@@ -565,42 +680,54 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
                               {alpha},
                               {num_seq_tile},
                               {attn_bias_dim0},
-                              {attn_bias_dim1}});
+                              {attn_bias_dim1},
+                              {static_cast<uint32_t>(compressed_head_size_u32)}});
 
-    return context.RunProgram(program);
+    ORT_RETURN_IF_ERROR(context.RunProgram(program));
+  } else {
+    // For decode path (sequence_length == 1)
+    const TensorShapeVector qk_dims({parameters.batch_size_, parameters.num_heads_,
+                                     parameters.sequence_length_, present_sequence_length});
+    const TensorShape qk_shape(qk_dims);
+    Tensor qk = context.CreateGPUTensor(Q->DataType(), qk_shape);
+    const uint32_t num_total_seq_length_tile = (parameters.total_sequence_length_ + tile_size - 1) / tile_size;
+    const uint32_t num_present_sequence_length_tile = (present_sequence_length + tile_size - 1) / tile_size;
+
+    // The metadata is used to store the max and sum of each tile.
+    const TensorShapeVector metadata_dims({parameters.batch_size_, parameters.num_heads_,
+                                           num_present_sequence_length_tile, 2});
+    const TensorShape metadata_shape(metadata_dims);
+    Tensor metadata = context.CreateGPUTensor(DataTypeImpl::GetType<float>(), metadata_shape);
+    ORT_RETURN_IF_ERROR(ComputeFlashAttentionDecodeQKT(context, Q, attention_bias, &qk,
+                                                       apply_hadamard ? tq_present_key : present_key,
+                                                       &metadata, seqlen_k,
+                                                       parameters, indirect_buffer_ptr, num_total_seq_length_tile,
+                                                       num_present_sequence_length_tile, tile_size, use_indirect_dispatch,
+                                                       present_sequence_length, apply_hadamard, compressed_head_size_u32));
+
+    const TensorShapeVector out_split_vx_dims({parameters.batch_size_, parameters.num_heads_,
+                                               num_present_sequence_length_tile, parameters.head_size_});
+    const TensorShape out_split_vx_shape(out_split_vx_dims);
+    Tensor out_split_vx = context.CreateGPUTensor(Q->DataType(), out_split_vx_shape);
+    ORT_RETURN_IF_ERROR(ComputeFlashAttentionDecodeSplitVxScore(context, &metadata, &qk, &out_split_vx,
+                                                                apply_hadamard ? tq_present_value : present_value,
+                                                                seqlen_k, parameters, indirect_buffer_ptr,
+                                                                num_total_seq_length_tile,
+                                                                num_present_sequence_length_tile, tile_size,
+                                                                use_indirect_dispatch, present_sequence_length,
+                                                                head_sink, apply_hadamard, compressed_head_size_u32));
+    ORT_RETURN_IF_ERROR(ComputeFlashAttentionDecodeVxReduce(context, &out_split_vx, attn_output, seqlen_k, parameters,
+                                                            num_total_seq_length_tile,
+                                                            num_present_sequence_length_tile, tile_size, use_indirect_dispatch));
   }
 
-  // For decode path (sequence_length == 1)
-  const TensorShapeVector qk_dims({parameters.batch_size_, parameters.num_heads_,
-                                   parameters.sequence_length_, present_sequence_length});
-  const TensorShape qk_shape(qk_dims);
-  Tensor qk = context.CreateGPUTensor(Q->DataType(), qk_shape);
-  const uint32_t num_total_seq_length_tile = (parameters.total_sequence_length_ + tile_size - 1) / tile_size;
-  const uint32_t num_present_sequence_length_tile = (present_sequence_length + tile_size - 1) / tile_size;
-
-  // The metadata is used to store the max and sum of each tile.
-  const TensorShapeVector metadata_dims({parameters.batch_size_, parameters.num_heads_,
-                                         num_present_sequence_length_tile, 2});
-  const TensorShape metadata_shape(metadata_dims);
-  Tensor metadata = context.CreateGPUTensor(DataTypeImpl::GetType<float>(), metadata_shape);
-  ORT_RETURN_IF_ERROR(ComputeFlashAttentionDecodeQKT(context, Q, attention_bias, &qk, present_key, &metadata, seqlen_k,
-                                                     parameters, indirect_buffer_ptr, num_total_seq_length_tile,
-                                                     num_present_sequence_length_tile, tile_size, use_indirect_dispatch,
-                                                     present_sequence_length));
-
-  const TensorShapeVector out_split_vx_dims({parameters.batch_size_, parameters.num_heads_,
-                                             num_present_sequence_length_tile, parameters.head_size_});
-  const TensorShape out_split_vx_shape(out_split_vx_dims);
-  Tensor out_split_vx = context.CreateGPUTensor(Q->DataType(), out_split_vx_shape);
-  ORT_RETURN_IF_ERROR(ComputeFlashAttentionDecodeSplitVxScore(context, &metadata, &qk, &out_split_vx, present_value,
-                                                              seqlen_k, parameters, indirect_buffer_ptr,
-                                                              num_total_seq_length_tile,
-                                                              num_present_sequence_length_tile, tile_size,
-                                                              use_indirect_dispatch, present_sequence_length,
-                                                              head_sink));
-  ORT_RETURN_IF_ERROR(ComputeFlashAttentionDecodeVxReduce(context, &out_split_vx, output, seqlen_k, parameters,
-                                                          num_total_seq_length_tile,
-                                                          num_present_sequence_length_tile, tile_size, use_indirect_dispatch));
+  // Apply inverse Hadamard transform: attn_output_temp → output.
+  if (apply_hadamard) {
+    ORT_RETURN_IF_ERROR(ApplyHadamardTransform(
+        context, attn_output, output,
+        parameters.batch_size_, parameters.sequence_length_,
+        parameters.num_heads_, parameters.head_size_));
+  }
 
   return Status::OK();
 }

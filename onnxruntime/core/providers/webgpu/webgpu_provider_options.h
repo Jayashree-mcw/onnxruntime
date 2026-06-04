@@ -13,6 +13,7 @@ constexpr const char* kPreferredLayout = "ep.webgpuexecutionprovider.preferredLa
 constexpr const char* kEnableGraphCapture = "ep.webgpuexecutionprovider.enableGraphCapture";
 constexpr const char* kEnableInt64 = "ep.webgpuexecutionprovider.enableInt64";
 constexpr const char* kMultiRotaryCacheConcatOffset = "ep.webgpuexecutionprovider.multiRotaryCacheConcatOffset";
+constexpr const char* kTurboQuant = "ep.webgpuexecutionprovider.turboQuant";
 
 constexpr const char* kDawnProcTable = "ep.webgpuexecutionprovider.dawnProcTable";
 
@@ -59,6 +60,9 @@ constexpr const char* kEnablePIXCapture_OFF = "0";
 
 constexpr const char* kPreserveDevice_ON = "1";
 constexpr const char* kPreserveDevice_OFF = "0";
+
+constexpr const char* kTurboQuant_ON = "1";
+constexpr const char* kTurboQuant_OFF = "0";
 
 constexpr const char* kBufferCacheMode_Disabled = "disabled";
 constexpr const char* kBufferCacheMode_LazyRelease = "lazyRelease";

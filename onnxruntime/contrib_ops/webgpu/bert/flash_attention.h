@@ -80,7 +80,9 @@ class FlashAttentionProgram final : public Program<FlashAttentionProgram> {
                         bool has_subgroups,
                         bool q_BNSH,
                         bool use_seqlen_k = false,
-                        bool has_head_sink = false)
+                        bool has_head_sink = false,
+                        bool turbo_quant = false,
+                        int compressed_head_size_u32 = 0)
       : Program{kernel_name},
         has_attention_bias_(has_attention_bias),
         is_qualcomm_(is_qualcomm),
@@ -92,7 +94,9 @@ class FlashAttentionProgram final : public Program<FlashAttentionProgram> {
         use_shm_path_(is_apple || is_nvidia || !has_subgroups),
         q_BNSH_(q_BNSH),
         use_seqlen_k_(use_seqlen_k),
-        has_head_sink_(has_head_sink) {
+        has_head_sink_(has_head_sink),
+        turbo_quant_(turbo_quant),
+        compressed_head_size_u32_(compressed_head_size_u32) {
     if (use_shm_path_) {
       // Use shared-memory loop-based path with dynamic max_k_step.
       // Compute max_k_step from workgroup shared memory budget: k_tile + v_tile = 2 * element_size * head_size * max_k_step
@@ -121,7 +125,8 @@ class FlashAttentionProgram final : public Program<FlashAttentionProgram> {
                                           {"alpha", ProgramUniformVariableDataType::Float32},
                                           {"num_seq_tile", ProgramUniformVariableDataType::Uint32},
                                           {"attn_bias_dim0", ProgramUniformVariableDataType::Uint32},
-                                          {"attn_bias_dim1", ProgramUniformVariableDataType::Uint32});
+                                          {"attn_bias_dim1", ProgramUniformVariableDataType::Uint32},
+                                          {"compressed_head_size_u32", ProgramUniformVariableDataType::Uint32});
 
  private:
   bool has_attention_bias_;
@@ -136,13 +141,17 @@ class FlashAttentionProgram final : public Program<FlashAttentionProgram> {
   bool use_seqlen_k_;
   bool has_head_sink_;
   int max_k_step_;
+  bool turbo_quant_;
+  int compressed_head_size_u32_;
 };
 
 class FlashAttentionDecodeQKTProgram final : public Program<FlashAttentionDecodeQKTProgram> {
  public:
   FlashAttentionDecodeQKTProgram(const std::string& kernel_name,
-                                 bool has_attention_bias, uint32_t tile_size, bool use_indirect_dispatch)
-      : Program{kernel_name}, has_attention_bias_(has_attention_bias), tile_size_(tile_size), use_indirect_dispatch_(use_indirect_dispatch) {
+                                 bool has_attention_bias, uint32_t tile_size, bool use_indirect_dispatch,
+                                 bool turbo_quant = false, int compressed_head_size_u32 = 0)
+      : Program{kernel_name}, has_attention_bias_(has_attention_bias), tile_size_(tile_size), use_indirect_dispatch_(use_indirect_dispatch),
+        turbo_quant_(turbo_quant), compressed_head_size_u32_(compressed_head_size_u32) {
   }
 
   Status GenerateShaderCode(ShaderHelper& sh) const override;
@@ -156,18 +165,23 @@ class FlashAttentionDecodeQKTProgram final : public Program<FlashAttentionDecode
                                           {"num_heads", ProgramUniformVariableDataType::Uint32},
                                           {"batch_size", ProgramUniformVariableDataType::Uint32},
                                           {"attn_bias_dim0", ProgramUniformVariableDataType::Uint32},
-                                          {"attn_bias_dim1", ProgramUniformVariableDataType::Uint32});
+                                          {"attn_bias_dim1", ProgramUniformVariableDataType::Uint32},
+                                          {"compressed_head_size_u32", ProgramUniformVariableDataType::Uint32});
 
  private:
   bool has_attention_bias_;
   uint32_t tile_size_;
   bool use_indirect_dispatch_;
+  bool turbo_quant_;
+  int compressed_head_size_u32_;
 };
 
 class FlashAttentionDecodeSplitVxProgram final : public Program<FlashAttentionDecodeSplitVxProgram> {
  public:
-  FlashAttentionDecodeSplitVxProgram(const std::string& kernel_name, uint32_t tile_size, int head_size_vec, bool use_indirect_dispatch, bool has_head_sink = false)
-      : Program{kernel_name}, tile_size_(tile_size), head_size_vec_(head_size_vec), use_indirect_dispatch_(use_indirect_dispatch), has_head_sink_(has_head_sink) {
+  FlashAttentionDecodeSplitVxProgram(const std::string& kernel_name, uint32_t tile_size, int head_size_vec, bool use_indirect_dispatch, bool has_head_sink = false,
+                                     bool turbo_quant = false, int compressed_head_size_u32 = 0)
+      : Program{kernel_name}, tile_size_(tile_size), head_size_vec_(head_size_vec), use_indirect_dispatch_(use_indirect_dispatch), has_head_sink_(has_head_sink),
+        turbo_quant_(turbo_quant), compressed_head_size_u32_(compressed_head_size_u32) {
   }
 
   Status GenerateShaderCode(ShaderHelper& sh) const override;
@@ -178,13 +192,16 @@ class FlashAttentionDecodeSplitVxProgram final : public Program<FlashAttentionDe
                                           {"n_reps", ProgramUniformVariableDataType::Uint32},
                                           {"num_present_sequence_length_tile", ProgramUniformVariableDataType::Uint32},
                                           {"batch_heads", ProgramUniformVariableDataType::Uint32},
-                                          {"num_heads", ProgramUniformVariableDataType::Uint32});
+                                          {"num_heads", ProgramUniformVariableDataType::Uint32},
+                                          {"compressed_head_size_u32", ProgramUniformVariableDataType::Uint32});
 
  private:
   uint32_t tile_size_;
   int head_size_vec_;
   bool use_indirect_dispatch_;
   bool has_head_sink_;
+  bool turbo_quant_;
+  int compressed_head_size_u32_;
 };
 
 class FlashAttentionDecodeVxReduceProgram final : public Program<FlashAttentionDecodeVxReduceProgram> {
