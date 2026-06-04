@@ -582,7 +582,7 @@ WebGpuExecutionProvider::WebGpuExecutionProvider(int context_id,
       // enable_int64_ is always true when enable_graph_capture_ is true
       enable_int64_{config.enable_graph_capture || config.enable_int64},
       multi_rotary_cache_concat_offset_{config.multi_rotary_cache_concat_offset},
-      turbo_quant_{config.turbo_quant},
+      turbo_quantization_bits_{config.turbo_quantization_bits},
       prepack_allocator_{std::make_shared<webgpu::GpuBufferAllocator>(
           [this]() -> const webgpu::BufferManager& { return context_.InitializerBufferManager(); }, false)} {
   if (config.enable_pix_capture) {

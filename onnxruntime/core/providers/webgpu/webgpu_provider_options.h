@@ -61,8 +61,11 @@ constexpr const char* kEnablePIXCapture_OFF = "0";
 constexpr const char* kPreserveDevice_ON = "1";
 constexpr const char* kPreserveDevice_OFF = "0";
 
-constexpr const char* kTurboQuant_ON = "1";
+// kTurboQuant value is the number of quantization bits as a string.
+// "0" disables quantization; "4" enables 4-bit KV cache quantization.
+// (Future: "8" for 8-bit.)
 constexpr const char* kTurboQuant_OFF = "0";
+constexpr const char* kTurboQuant_4Bit = "4";
 
 constexpr const char* kBufferCacheMode_Disabled = "disabled";
 constexpr const char* kBufferCacheMode_LazyRelease = "lazyRelease";
