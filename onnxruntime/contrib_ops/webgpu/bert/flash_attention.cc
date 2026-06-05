@@ -556,17 +556,25 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
   } else if (do_rotary) {
     ORT_ENFORCE(parameters.is_packed_qkv_, "Fused SplitPackedQKVWithRotaryEmbeddingAndCopyKV requires packed QKV input.");
     ORT_ENFORCE(parameters.past_present_share_buffer_, "Fused SplitPackedQKVWithRotaryEmbeddingAndCopyKV requires static KV cache.");
-    ORT_ENFORCE(!apply_hadamard, "Fused SplitPackedQKVWithRotaryEmbeddingAndCopyKV does not support TurboQuant. "
-                "Split+rotate QKV before calling ApplyFlashAttention so TurboQuantCopyKVCache can be used.");
 
     // Q points to the packed QKV tensor in this case, create query output tensor
     query_output = context.CreateGPUTensor(Q->DataType(), TensorShape({parameters.batch_size_, parameters.sequence_length_, parameters.hidden_size_}));
 
-    ORT_RETURN_IF_ERROR(RunSplitPackedQKVWithRotaryEmbeddingAndCopyKV(context, parameters,
-                                                                      Q, seqlen_k,
-                                                                      cos_cache, sin_cache,
-                                                                      &query_output, present_key, present_value,
-                                                                      indirect_buffer_ptr, tile_size));
+    if (apply_hadamard) {
+      // Fused TurboQuant path: split packed QKV + rotary K + Hadamard + quantize K/V + rotary Q
+      // in a single dispatch. Writes compressed K/V directly to the u32 present cache views.
+      ORT_RETURN_IF_ERROR(TurboQuantFusedSplitRotaryCopyKV(context, parameters,
+                                                           Q, seqlen_k,
+                                                           cos_cache, sin_cache,
+                                                           &query_output, tq_present_key, tq_present_value,
+                                                           indirect_buffer_ptr, tile_size));
+    } else {
+      ORT_RETURN_IF_ERROR(RunSplitPackedQKVWithRotaryEmbeddingAndCopyKV(context, parameters,
+                                                                        Q, seqlen_k,
+                                                                        cos_cache, sin_cache,
+                                                                        &query_output, present_key, present_value,
+                                                                        indirect_buffer_ptr, tile_size));
+    }
     Q = &query_output;
   } else if (apply_hadamard && K != nullptr && V != nullptr) {
     // Fused path: apply Hadamard transform to new K/V tokens while copying them into the KV cache.

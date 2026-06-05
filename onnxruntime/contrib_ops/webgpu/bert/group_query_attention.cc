@@ -322,10 +322,8 @@ Status GroupQueryAttention::ComputeInternal(onnxruntime::webgpu::ComputeContext&
     }
   } else if (parameters.is_packed_qkv_ && do_rotary_) {
     // Use the ultimate fused operation when FlashAttention and static KV cache is enabled.
-    // Skip the fused path when TurboQuant is active: the fused shader writes uncompressed K/V
-    // directly to the cache, bypassing the Hadamard+quantize step. Instead, split+rotate first
-    // and let ApplyFlashAttention use TurboQuantCopyKVCache for the KV write.
-    if (will_use_flash_attention && parameters.past_present_share_buffer_ && !context.TurboQuantEnabled()) {
+    // When TurboQuant is active, ApplyFlashAttention handles the fused split+rotary+Hadamard+quantize path.
+    if (will_use_flash_attention && parameters.past_present_share_buffer_) {
       // Directly call ApplyFlashAttention with fused split/rotary/copyKV enabled
       // query points to packed QKV, K and V are nullptr since they're not needed
       return ApplyFlashAttention(query, nullptr, nullptr, attention_bias, output, past_key, present_key, past_value,

@@ -59,6 +59,61 @@ Status TurboQuantCopyKVCache(onnxruntime::webgpu::ComputeContext& context, const
                              const Tensor* V, const Tensor* past_value, Tensor* present_value,
                              uint32_t tile_size, const Tensor* seqlen_k, Tensor* indirect_buffer);
 
+// Fused TurboQuant: Split packed QKV + Rotary K + Hadamard + Quantize K/V + Rotary Q.
+// Single dispatch handles all Q/K/V processing from packed QKV input.
+class TurboQuantFusedRotaryProgram final : public Program<TurboQuantFusedRotaryProgram> {
+ public:
+  TurboQuantFusedRotaryProgram(const std::string& kernel_name, int head_size, int head_size_log2,
+                               int half_rotary_dim,
+                               int compressed_head_size_u32,
+                               bool past_present_share_buffer,
+                               bool prepare_indirect_dispatch, bool use_seqlen_k,
+                               uint32_t multi_rotary_cache_concat_offset)
+      : Program{kernel_name},
+        head_size_(head_size), head_size_log2_(head_size_log2),
+        half_rotary_dim_(half_rotary_dim),
+        compressed_head_size_u32_(compressed_head_size_u32),
+        past_present_share_buffer_(past_present_share_buffer),
+        prepare_indirect_dispatch_(prepare_indirect_dispatch), use_seqlen_k_(use_seqlen_k),
+        multi_rotary_cache_concat_offset_(multi_rotary_cache_concat_offset) {}
+
+  Status GenerateShaderCode(ShaderHelper& sh) const override;
+
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"total_sequence_length", ProgramUniformVariableDataType::Uint32},
+                                          {"kv_sequence_length", ProgramUniformVariableDataType::Uint32},
+                                          {"tile_size", ProgramUniformVariableDataType::Uint32},
+                                          {"num_heads", ProgramUniformVariableDataType::Uint32},
+                                          {"kv_num_heads", ProgramUniformVariableDataType::Uint32},
+                                          {"num_kv_slices", ProgramUniformVariableDataType::Uint32},
+                                          {"num_q_slices", ProgramUniformVariableDataType::Uint32},
+                                          {"present_seq_length", ProgramUniformVariableDataType::Uint32},
+                                          {"compressed_head_size_u32", ProgramUniformVariableDataType::Uint32},
+                                          {"hidden_size", ProgramUniformVariableDataType::Uint32},
+                                          {"kv_hidden_size", ProgramUniformVariableDataType::Uint32});
+
+ private:
+  int head_size_;
+  int head_size_log2_;
+  int half_rotary_dim_;
+  int compressed_head_size_u32_;
+  bool past_present_share_buffer_;
+  bool prepare_indirect_dispatch_;
+  bool use_seqlen_k_;
+  uint32_t multi_rotary_cache_concat_offset_;
+};
+
+Status TurboQuantFusedSplitRotaryCopyKV(onnxruntime::webgpu::ComputeContext& context,
+                                        const WebgpuAttentionParameters& parameters,
+                                        const Tensor* packedQKV,
+                                        const Tensor* seqlen_k,
+                                        const Tensor* cos_cache,
+                                        const Tensor* sin_cache,
+                                        Tensor* query,
+                                        Tensor* present_key,
+                                        Tensor* present_value,
+                                        Tensor* indirect_buffer,
+                                        uint32_t tile_size);
+
 }  // namespace webgpu
 }  // namespace contrib
 }  // namespace onnxruntime
