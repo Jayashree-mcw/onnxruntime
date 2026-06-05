@@ -204,7 +204,13 @@ Status GroupQueryAttention::ComputeInternal(onnxruntime::webgpu::ComputeContext&
   // the tensor depends on its element type: fp16 → ×2, fp32 → ×1.
   int kv_compressed_head_size = 0;
   if (context.TurboQuantEnabled() && past_key != nullptr) {
-    const int head_size_from_q = static_cast<int>(query->Shape().GetDims()[2]) / num_heads_;
+    const int qkv_last_dim = static_cast<int>(query->Shape().GetDims()[2]);
+    // For packed QKV, dim[2] contains Q+K+V concatenated, so divide by (num_heads + 2*kv_num_heads).
+    // For separate Q, dim[2] is just Q hidden size, so divide by num_heads.
+    const bool is_packed_qkv = (key == nullptr || !key->Shape().Size());
+    const int head_size_from_q = is_packed_qkv
+                                     ? qkv_last_dim / (num_heads_ + 2 * kv_num_heads_)
+                                     : qkv_last_dim / num_heads_;
     const int compressed_u32_words = head_size_from_q / 8 + 1;
     const int bytes_per_element = static_cast<int>(past_key->DataType()->Size());
     kv_compressed_head_size = compressed_u32_words * (4 / bytes_per_element);  // 4 bytes per u32
@@ -316,7 +322,10 @@ Status GroupQueryAttention::ComputeInternal(onnxruntime::webgpu::ComputeContext&
     }
   } else if (parameters.is_packed_qkv_ && do_rotary_) {
     // Use the ultimate fused operation when FlashAttention and static KV cache is enabled.
-    if (will_use_flash_attention && parameters.past_present_share_buffer_) {
+    // Skip the fused path when TurboQuant is active: the fused shader writes uncompressed K/V
+    // directly to the cache, bypassing the Hadamard+quantize step. Instead, split+rotate first
+    // and let ApplyFlashAttention use TurboQuantCopyKVCache for the KV write.
+    if (will_use_flash_attention && parameters.past_present_share_buffer_ && !context.TurboQuantEnabled()) {
       // Directly call ApplyFlashAttention with fused split/rotary/copyKV enabled
       // query points to packed QKV, K and V are nullptr since they're not needed
       return ApplyFlashAttention(query, nullptr, nullptr, attention_bias, output, past_key, present_key, past_value,

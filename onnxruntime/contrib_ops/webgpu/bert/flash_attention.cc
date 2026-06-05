@@ -556,6 +556,8 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
   } else if (do_rotary) {
     ORT_ENFORCE(parameters.is_packed_qkv_, "Fused SplitPackedQKVWithRotaryEmbeddingAndCopyKV requires packed QKV input.");
     ORT_ENFORCE(parameters.past_present_share_buffer_, "Fused SplitPackedQKVWithRotaryEmbeddingAndCopyKV requires static KV cache.");
+    ORT_ENFORCE(!apply_hadamard, "Fused SplitPackedQKVWithRotaryEmbeddingAndCopyKV does not support TurboQuant. "
+                "Split+rotate QKV before calling ApplyFlashAttention so TurboQuantCopyKVCache can be used.");
 
     // Q points to the packed QKV tensor in this case, create query output tensor
     query_output = context.CreateGPUTensor(Q->DataType(), TensorShape({parameters.batch_size_, parameters.sequence_length_, parameters.hidden_size_}));
@@ -566,12 +568,6 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
                                                                       &query_output, present_key, present_value,
                                                                       indirect_buffer_ptr, tile_size));
     Q = &query_output;
-
-    // For the fused rotary path, new K/V entries are already written into the static KV cache
-    // by the fused shader. To apply Hadamard only to the new entries we'd need a strided/offset
-    // kernel since they sit at [B, N, past_seq..past_seq+kv_seq, H] inside the BNSH cache and
-    // are not globally contiguous. TODO: fuse Hadamard into the SplitPackedQKV shader, or add
-    // an offset-aware Hadamard kernel. Hadamard is skipped for the rotary path for now.
   } else if (apply_hadamard && K != nullptr && V != nullptr) {
     // Fused path: apply Hadamard transform to new K/V tokens while copying them into the KV cache.
     // This replaces 3 dispatches (Hadamard K + Hadamard V + CopyKVCache) with 1 dispatch.
