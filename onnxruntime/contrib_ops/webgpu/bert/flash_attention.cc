@@ -249,6 +249,7 @@ Status FlashAttentionDecodeQKTProgram::GenerateShaderCode(ShaderHelper& shader) 
   return WGSL_TEMPLATE_APPLY(shader, "bert/flash_attention_decode_qkt.wgsl.template",
                              WGSL_TEMPLATE_PARAMETER(compressed_head_size_u32, compressed_head_size_u32_),
                              WGSL_TEMPLATE_PARAMETER(has_attention_bias, has_attention_bias_),
+                             WGSL_TEMPLATE_PARAMETER(head_size_vec, head_size_vec_),
                              WGSL_TEMPLATE_PARAMETER(sub_tile_count, sub_tile_count),
                              WGSL_TEMPLATE_PARAMETER(tile_size, tile_size_),
                              WGSL_TEMPLATE_PARAMETER(tile_size_k_vec, tile_size_k_vec),
@@ -267,7 +268,7 @@ Status ComputeFlashAttentionDecodeQKT(onnxruntime::webgpu::ComputeContext& conte
   const int components = turbo_quant ? 1 : 4;
 
   FlashAttentionDecodeQKTProgram program{"FlashAttentionDecodeQKT", has_attention_bias, tile_size, use_indirect_dispatch,
-                                         turbo_quant, compressed_head_size_u32};
+                                         turbo_quant, compressed_head_size_u32, static_cast<int>(parameters.head_size_ / 4)};
   program.AddInputs({{Q, ProgramTensorMetadataDependency::TypeAndRank, 4},
                      {present_key, ProgramTensorMetadataDependency::TypeAndRank, components}});
   if (use_indirect_dispatch) {
@@ -296,7 +297,7 @@ Status ComputeFlashAttentionDecodeQKT(onnxruntime::webgpu::ComputeContext& conte
     program.SetDispatchGroupSize(parameters.batch_size_ * parameters.num_heads_ * num_total_seq_length_tile);
   }
   program.SetWorkgroupSize(64)
-      .CacheHint(tile_size, has_attention_bias, use_indirect_dispatch, turbo_quant, compressed_head_size_u32)
+      .CacheHint(tile_size, has_attention_bias, use_indirect_dispatch, turbo_quant, compressed_head_size_u32, vectorized_head_size)
       .AddUniformVariables({{static_cast<uint32_t>(vectorized_head_size)},
                             {static_cast<uint32_t>(parameters.total_sequence_length_)},
                             {static_cast<float>(alpha)},
@@ -486,18 +487,18 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
     indirect_buffer_ptr = &indirect_buffer;
   }
 
-  // Determine if Hadamard rotation applies (head_size must be power of 2 and >= 4).
-  // Only enabled when TurboQuant is set via provider options.
-  const bool apply_hadamard = context.TurboQuantEnabled() &&
-                              (parameters.head_size_ & (parameters.head_size_ - 1)) == 0 &&
-                              parameters.head_size_ >= 4;
+  // TurboQuant requires head_size > 4 and power of 2 (Hadamard transform needs power-of-2,
+  // and packing 8 indices per u32 needs head_size >= 8). Silently disable if not met.
+  const bool turbo_quant_enabled = context.TurboQuantEnabled() &&
+                              parameters.head_size_ >= 8 &&
+                              (parameters.head_size_ & (parameters.head_size_ - 1)) == 0;
 
   // Tensors to hold rotated K/V inputs (must persist through CopyKVCache).
   Tensor rotated_k_tensor;
   Tensor rotated_v_tensor;
 
   // Compressed KV cache: 1 u32 for norm + head_size/8 u32s for packed 4-bit indices.
-  const int compressed_head_size_u32 = apply_hadamard ? (parameters.head_size_ / 8 + 1) : 0;
+  const int compressed_head_size_u32 = turbo_quant_enabled ? (parameters.head_size_ / 8 + 1) : 0;
 
   // When TurboQuant is active, create u32 tensor views over present/past KV cache buffers.
   // GenAI allocates the KV cache with kv_cache_head_size matching compressed_head_size_u32,
@@ -508,7 +509,7 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
   Tensor* tq_present_value = present_value;
   const Tensor* tq_past_key = past_key;
   const Tensor* tq_past_value = past_value;
-  if (apply_hadamard) {
+  if (turbo_quant_enabled) {
     // present KV views: reinterpret as u32 with compressed head dim.
     TensorShapeVector u32_present_shape({present_key->Shape()[0], present_key->Shape()[1],
                                          present_key->Shape()[2],
@@ -560,7 +561,7 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
     // Q points to the packed QKV tensor in this case, create query output tensor
     query_output = context.CreateGPUTensor(Q->DataType(), TensorShape({parameters.batch_size_, parameters.sequence_length_, parameters.hidden_size_}));
 
-    if (apply_hadamard) {
+    if (turbo_quant_enabled) {
       // Fused TurboQuant path: split packed QKV + rotary K + Hadamard + quantize K/V + rotary Q
       // in a single dispatch. Writes compressed K/V directly to the u32 present cache views.
       ORT_RETURN_IF_ERROR(TurboQuantFusedSplitRotaryCopyKV(context, parameters,
@@ -576,7 +577,7 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
                                                                         indirect_buffer_ptr, tile_size));
     }
     Q = &query_output;
-  } else if (apply_hadamard && K != nullptr && V != nullptr) {
+  } else if (turbo_quant_enabled && K != nullptr && V != nullptr) {
     // Fused path: apply Hadamard transform to new K/V tokens while copying them into the KV cache.
     // This replaces 3 dispatches (Hadamard K + Hadamard V + CopyKVCache) with 1 dispatch.
     // Pass u32 tensor views for present/past KV cache (quantized output).
@@ -592,7 +593,7 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
   const uint32_t present_sequence_length = static_cast<uint32_t>(present_key->Shape()[2]);
 
   // Rotate Q before attention.
-  if (apply_hadamard) {
+  if (turbo_quant_enabled) {
     rotated_q = context.CreateGPUTensor(Q->DataType(), Q->Shape());
     if (parameters.qkv_format_ == Q_K_V_BNSH) {
       ORT_RETURN_IF_ERROR(ApplyHadamardTransform(
@@ -609,10 +610,10 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
   }
 
   // When Hadamard is active, write attention output to a temp buffer, then
-  // inverse-Hadamard from temp → final output. This avoids an extra copy.
+  // inverse-Hadamard from temp → final output.
   Tensor attn_output_temp;
   Tensor* attn_output = output;
-  if (apply_hadamard) {
+  if (turbo_quant_enabled) {
     attn_output_temp = context.CreateGPUTensor(output->DataType(), output->Shape());
     attn_output = &attn_output_temp;
   }
@@ -639,14 +640,14 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
                                   q_BNSH,
                                   use_seqlen_k,
                                   has_head_sink,
-                                  apply_hadamard,
+                                  turbo_quant_enabled,
                                   compressed_head_size_u32};
     // When TQ is active, KV cache is u32-packed — use u32 tensor views for present_key/present_value.
-    const Tensor* fa_present_key = apply_hadamard ? tq_present_key : present_key;
-    const Tensor* fa_present_value = apply_hadamard ? tq_present_value : present_value;
+    const Tensor* fa_present_key = turbo_quant_enabled ? tq_present_key : present_key;
+    const Tensor* fa_present_value = turbo_quant_enabled ? tq_present_value : present_value;
     program.AddInputs({{Q, ProgramTensorMetadataDependency::TypeAndRank, 4},
-                       {fa_present_key, ProgramTensorMetadataDependency::TypeAndRank, apply_hadamard ? 1 : 4},
-                       {fa_present_value, ProgramTensorMetadataDependency::TypeAndRank, apply_hadamard ? 1 : 4}});
+                       {fa_present_key, ProgramTensorMetadataDependency::TypeAndRank, turbo_quant_enabled ? 1 : 4},
+                       {fa_present_value, ProgramTensorMetadataDependency::TypeAndRank, turbo_quant_enabled ? 1 : 4}});
     if (has_attention_bias) {
       program.AddInputs({{attention_bias, ProgramTensorMetadataDependency::TypeAndRank}});
     }
@@ -675,7 +676,7 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
 
     program.SetDispatchGroupSize(parameters.batch_size_ * parameters.num_heads_ * num_seq_tile)
         .SetWorkgroupSize(prefill_tile_size)
-        .CacheHint(has_attention_bias, parameters.head_size_, parameters.num_heads_, parameters.is_unidirectional_, is_qualcomm, is_nvidia, is_apple, has_subgroups, q_BNSH, use_seqlen_k, has_head_sink, apply_hadamard, compressed_head_size_u32, program.max_k_step())
+        .CacheHint(has_attention_bias, parameters.head_size_, parameters.num_heads_, parameters.is_unidirectional_, is_qualcomm, is_nvidia, is_apple, has_subgroups, q_BNSH, use_seqlen_k, has_head_sink, turbo_quant_enabled, compressed_head_size_u32, program.max_k_step())
         .AddUniformVariables({{static_cast<uint32_t>(parameters.sequence_length_)},
                               {static_cast<uint32_t>(parameters.total_sequence_length_)},
                               {static_cast<uint32_t>(present_sequence_length)},
@@ -702,31 +703,38 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
                                            num_present_sequence_length_tile, 2});
     const TensorShape metadata_shape(metadata_dims);
     Tensor metadata = context.CreateGPUTensor(DataTypeImpl::GetType<float>(), metadata_shape);
+
+    // For TurboQuant decode, use the TQ-compressed cache directly with inline dequant.
+    Tensor* decode_present_key = turbo_quant_enabled ? tq_present_key : present_key;
+    Tensor* decode_present_value = turbo_quant_enabled ? tq_present_value : present_value;
+    bool decode_turbo_quant = turbo_quant_enabled;
+    int decode_compressed_head_size_u32 = compressed_head_size_u32;
+
     ORT_RETURN_IF_ERROR(ComputeFlashAttentionDecodeQKT(context, Q, attention_bias, &qk,
-                                                       apply_hadamard ? tq_present_key : present_key,
+                                                       decode_present_key,
                                                        &metadata, seqlen_k,
                                                        parameters, indirect_buffer_ptr, num_total_seq_length_tile,
                                                        num_present_sequence_length_tile, tile_size, use_indirect_dispatch,
-                                                       present_sequence_length, apply_hadamard, compressed_head_size_u32));
+                                                       present_sequence_length, decode_turbo_quant, decode_compressed_head_size_u32));
 
     const TensorShapeVector out_split_vx_dims({parameters.batch_size_, parameters.num_heads_,
                                                num_present_sequence_length_tile, parameters.head_size_});
     const TensorShape out_split_vx_shape(out_split_vx_dims);
     Tensor out_split_vx = context.CreateGPUTensor(Q->DataType(), out_split_vx_shape);
     ORT_RETURN_IF_ERROR(ComputeFlashAttentionDecodeSplitVxScore(context, &metadata, &qk, &out_split_vx,
-                                                                apply_hadamard ? tq_present_value : present_value,
+                                                                decode_present_value,
                                                                 seqlen_k, parameters, indirect_buffer_ptr,
                                                                 num_total_seq_length_tile,
                                                                 num_present_sequence_length_tile, tile_size,
                                                                 use_indirect_dispatch, present_sequence_length,
-                                                                head_sink, apply_hadamard, compressed_head_size_u32));
+                                                                head_sink, decode_turbo_quant, decode_compressed_head_size_u32));
     ORT_RETURN_IF_ERROR(ComputeFlashAttentionDecodeVxReduce(context, &out_split_vx, attn_output, seqlen_k, parameters,
                                                             num_total_seq_length_tile,
                                                             num_present_sequence_length_tile, tile_size, use_indirect_dispatch));
   }
 
   // Apply inverse Hadamard transform: attn_output_temp → output.
-  if (apply_hadamard) {
+  if (turbo_quant_enabled) {
     ORT_RETURN_IF_ERROR(ApplyHadamardTransform(
         context, attn_output, output,
         parameters.batch_size_, parameters.sequence_length_,

@@ -149,9 +149,9 @@ class FlashAttentionDecodeQKTProgram final : public Program<FlashAttentionDecode
  public:
   FlashAttentionDecodeQKTProgram(const std::string& kernel_name,
                                  bool has_attention_bias, uint32_t tile_size, bool use_indirect_dispatch,
-                                 bool turbo_quant = false, int compressed_head_size_u32 = 0)
+                                 bool turbo_quant = false, int compressed_head_size_u32 = 0, int head_size_vec = 0)
       : Program{kernel_name}, has_attention_bias_(has_attention_bias), tile_size_(tile_size), use_indirect_dispatch_(use_indirect_dispatch),
-        turbo_quant_(turbo_quant), compressed_head_size_u32_(compressed_head_size_u32) {
+        turbo_quant_(turbo_quant), compressed_head_size_u32_(compressed_head_size_u32), head_size_vec_(head_size_vec) {
   }
 
   Status GenerateShaderCode(ShaderHelper& sh) const override;
@@ -174,6 +174,7 @@ class FlashAttentionDecodeQKTProgram final : public Program<FlashAttentionDecode
   bool use_indirect_dispatch_;
   bool turbo_quant_;
   int compressed_head_size_u32_;
+  int head_size_vec_;
 };
 
 class FlashAttentionDecodeSplitVxProgram final : public Program<FlashAttentionDecodeSplitVxProgram> {

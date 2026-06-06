@@ -48,6 +48,10 @@ alias present_value_value_t = out_split_vx_value_t;
 var<workgroup> tile_qk: array<present_value_element_t, tile_size>;
 var<workgroup> tile_output: array<present_value_value_t, head_size_vec>;
 var<workgroup> qkv_values: array<array<present_value_value_t, tile_size_k_vec>, sub_tile_count>;
+#if turbo_quant
+var<workgroup> tq_scales: array<f32, tile_size>;
+var<workgroup> tq_lut: array<f32, 16>;
+#endif
 
 $MAIN {
   let local_row = u32(local_idx / tile_size_k_vec);
@@ -95,7 +99,18 @@ $MAIN {
 
     if (total_seq_offset + local_idx < total_sequence_length) {
       tile_qk[local_idx] = present_value_element_t(exp(f32(qk[batch_head_idx * uniforms.present_sequence_length + total_seq_offset + local_idx]) - g_max) / g_sum);
+#if turbo_quant
+      // Preload scales for this tile (avoids redundant loads across k iterations).
+      let scale_base = present_offset + (total_seq_offset + local_idx) * COMPRESSED_HEAD_U32;
+      tq_scales[local_idx] = bitcast<f32>(present_value[scale_base]);
+#endif
     }
+#if turbo_quant
+  // Load centroid LUT into shared memory.
+  if (local_idx < 16u) {
+    tq_lut[local_idx] = TQ_CENTROIDS[local_idx];
+  }
+#endif
 
   for (var k: u32 = 0u; k < head_size_vec; k += tile_size_k_vec) {
     var value = present_value_value_t(0);
@@ -107,14 +122,20 @@ $MAIN {
         let seq_idx = total_seq_offset + row_offset + local_row;
         if (seq_idx < total_sequence_length) {
 #if turbo_quant
-          let base = present_offset + seq_idx * COMPRESSED_HEAD_U32;
-          let norm = bitcast<f32>(present_value[base]);
+          // Full-word approach: read one u32, extract all 8 nibbles for 2 output vec4 positions.
+          // But this thread only owns position (k + local_col). Determine which half of the word it needs.
           let elem_base = (k + local_col) * 4u;
-          let c0 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 0u)] * norm;
-          let c1 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 1u)] * norm;
-          let c2 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 2u)] * norm;
-          let c3 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 3u)] * norm;
-          let v_val = present_value_value_t(present_value_element_t(c0), present_value_element_t(c1), present_value_element_t(c2), present_value_element_t(c3));
+          let tq_word_idx = elem_base >> 3u;
+          let base = present_offset + seq_idx * COMPRESSED_HEAD_U32;
+          let scale = tq_scales[row_offset + local_row];
+          let packed = present_value[base + 1u + tq_word_idx];
+          let tq_shift = (elem_base & 4u) << 2u;
+          let nibbles = packed >> tq_shift;
+          let v_val = present_value_value_t(
+              present_value_element_t(tq_lut[(nibbles) & 0xFu] * scale),
+              present_value_element_t(tq_lut[(nibbles >> 4u) & 0xFu] * scale),
+              present_value_element_t(tq_lut[(nibbles >> 8u) & 0xFu] * scale),
+              present_value_element_t(tq_lut[(nibbles >> 12u) & 0xFu] * scale));
           value += v_val * tile_qk[row_offset + local_row];
 #else
           value += present_value[present_offset + seq_idx * head_size_vec + k + local_col] * tile_qk[row_offset + local_row];

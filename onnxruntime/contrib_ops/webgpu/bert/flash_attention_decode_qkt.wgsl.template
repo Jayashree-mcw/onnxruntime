@@ -7,11 +7,13 @@
 #param sub_tile_count
 #param turbo_quant
 #param compressed_head_size_u32
+#param head_size_vec
 #param use_indirect_dispatch
 
 #if turbo_quant
 #include "bert/turbo_quant_common.wgsl.template"
 const COMPRESSED_HEAD_U32 : u32 = compressed_head_size_u32;
+const COMPRESSED_HEAD_U32_WITHOUT_SCALE : u32 = COMPRESSED_HEAD_U32 - 1u;
 #endif
 
 // Note that this shader adopts similar algorithm with dp4a generation shader.
@@ -20,11 +22,10 @@ const COMPRESSED_HEAD_U32 : u32 = compressed_head_size_u32;
 // by processing on the k (head_size) dimension at each step amongst
 // tile_size_k_vec threads, and utilizing the remaining threads in the workgroup
 // to process additional rows of |present_key| in parallel (such that the values
-// in shared memory (tile_q) for |q| can be reused). For each load of q, the
-// tile_size_k_vec threads also reload |present_key| tile_size/sub_tile_count
-// times to compute partial dot products of other |present_key| rows in order to
-// complete all tile_size |present_key| rows in this workgroup and also reusing
-// the loaded in register values of |q|.
+// in shared memory (all_q) for |q| can be reused). The tile_size_k_vec threads
+// also reload |present_key| tile_size/sub_tile_count times to compute partial
+// dot products of other |present_key| rows in order to complete all tile_size
+// |present_key| rows in this workgroup and also reusing the loaded values of |q|.
 
 // 1. Each workgroup processes one row of |q| and tile_size rows of |present_key|
 //
@@ -37,9 +38,14 @@ const COMPRESSED_HEAD_U32 : u32 = compressed_head_size_u32;
 //      inner_qk_values
 //    - Performs final reduction sum in inner_qk_values for output
 
-var<workgroup> tile_q: array<q_value_t, tile_size_k_vec>;
 var<workgroup> inner_qk_values: array<array<q_element_t, tile_size_k_vec>, tile_size>;
 var<workgroup> tile_qk: array<q_element_t, tile_size>;
+// Preload all Q vec4s upfront so the k-loop is barrier-free for Q access.
+var<workgroup> all_q: array<q_value_t, head_size_vec>;
+#if turbo_quant
+var<workgroup> tq_scales: array<f32, tile_size>;
+var<workgroup> tq_lut: array<f32, 16>;
+#endif
 
 #if has_attention_bias
   fn loadAttentionBias(batch_idx: u32, head_idx: u32, q_idx: u32, k_idx: u32, total_seq_length: u32) -> q_element_t
@@ -80,49 +86,70 @@ $MAIN {
     return;
   }
   let q_offset = batch_idx * uniforms.num_heads * uniforms.head_size_vec + head_idx * uniforms.head_size_vec;
+
+  // Preload all Q vec4s into shared memory (both TQ and non-TQ paths).
+  // This eliminates per-chunk barriers in the k-loop since all_q is read-only after this point.
+  if (local_idx < head_size_vec) {
+    all_q[local_idx] = q[q_offset + local_idx] * q_element_t(uniforms.alpha);
+  }
+
 #if turbo_quant
-  // TurboQuant: present_key is u32-packed (norm + 4-bit indices). Dequantize K on-the-fly.
+  // TurboQuant: present_key is u32-packed (scale + 4-bit indices). Dequantize K on-the-fly.
+  // Full-word approach: each thread reads one u32 word and extracts all 8 nibbles → 2 vec4 dot products.
   let kv_head_offset = (batch_head_idx / uniforms.n_reps) * uniforms.present_sequence_length * COMPRESSED_HEAD_U32;
-  for (var k: u32 = 0u; k < uniforms.head_size_vec; k += tile_size_k_vec) {
-    if (local_idx < tile_size_k_vec && k + local_idx < uniforms.head_size_vec) {
-      tile_q[local_idx] = q[q_offset + k + local_idx];
-    }
-    workgroupBarrier();
-    let q_data = tile_q[local_col] * q_element_t(uniforms.alpha);
-    if (k + local_col < uniforms.head_size_vec) {
+
+  // Preload centroid LUT and scales in parallel with Q.
+  if (local_idx < 16u) {
+    tq_lut[local_idx] = TQ_CENTROIDS[local_idx];
+  }
+  if (total_seq_offset + local_idx < total_sequence_length) {
+    let scale_base = kv_head_offset + (total_seq_offset + local_idx) * COMPRESSED_HEAD_U32;
+    tq_scales[local_idx] = bitcast<f32>(present_key[scale_base]);
+  }
+  workgroupBarrier();
+
+  // Each thread processes one u32 word per iteration (all 8 nibbles → 2 dot products).
+  for (var kw: u32 = 0u; kw < COMPRESSED_HEAD_U32_WITHOUT_SCALE; kw += tile_size_k_vec) {
+    let word_idx = kw + local_col;
+    if (word_idx < COMPRESSED_HEAD_U32_WITHOUT_SCALE) {
+      // Two Q vec4 positions per word: q_idx_lo = word*2, q_idx_hi = word*2+1
+      let q_lo = all_q[word_idx * 2u];
+      let q_hi = all_q[word_idx * 2u + 1u];
+
       for (var row_offset = 0u; row_offset < tile_size; row_offset += sub_tile_count) {
         let seq_idx = total_seq_offset + row_offset + local_row;
         if (seq_idx < total_sequence_length) {
           let base = kv_head_offset + seq_idx * COMPRESSED_HEAD_U32;
-          let norm = bitcast<f32>(present_key[base]);
-          let elem_base = (k + local_col) * 4u;
-          let c0 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 0u)] * norm;
-          let c1 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 1u)] * norm;
-          let c2 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 2u)] * norm;
-          let c3 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 3u)] * norm;
-          let k_val = q_value_t(q_element_t(c0), q_element_t(c1), q_element_t(c2), q_element_t(c3));
-          inner_qk_values[row_offset + local_row][local_col] += dot(k_val, q_data);
+          let packed = present_key[base + 1u + word_idx];
+          let k_lo = q_value_t(
+              q_element_t(tq_lut[(packed) & 0xFu]),
+              q_element_t(tq_lut[(packed >> 4u) & 0xFu]),
+              q_element_t(tq_lut[(packed >> 8u) & 0xFu]),
+              q_element_t(tq_lut[(packed >> 12u) & 0xFu]));
+          let k_hi = q_value_t(
+              q_element_t(tq_lut[(packed >> 16u) & 0xFu]),
+              q_element_t(tq_lut[(packed >> 20u) & 0xFu]),
+              q_element_t(tq_lut[(packed >> 24u) & 0xFu]),
+              q_element_t(tq_lut[(packed >> 28u) & 0xFu]));
+          inner_qk_values[row_offset + local_row][local_col] += dot(k_lo, q_lo) + dot(k_hi, q_hi);
         }
       }
     }
-    workgroupBarrier();
   }
+  workgroupBarrier();
 #else
-  let present_offset = batch_head_idx / uniforms.n_reps * uniforms.present_sequence_length * uniforms.head_size_vec;
-  for (var k: u32 = 0u; k < uniforms.head_size_vec; k += tile_size_k_vec) {
-    if (local_idx < tile_size_k_vec && k + local_idx < uniforms.head_size_vec) {
-      tile_q[local_idx] = q[q_offset + k + local_idx];
-    }
-    workgroupBarrier();
-    let q_data = tile_q[local_col] * q_element_t(uniforms.alpha);
-    if (k + local_col < uniforms.head_size_vec) {
+  workgroupBarrier();
+
+  let present_offset = batch_head_idx / uniforms.n_reps * uniforms.present_sequence_length * head_size_vec;
+  for (var k: u32 = 0u; k < head_size_vec; k += tile_size_k_vec) {
+    let q_data = all_q[k + local_col];
+    if (k + local_col < head_size_vec) {
       for (var row_offset = 0u; row_offset < tile_size; row_offset += sub_tile_count) {
         if (total_seq_offset + row_offset + local_row < total_sequence_length) {
-          inner_qk_values[row_offset + local_row][local_col] += dot(present_key[present_offset + (total_seq_offset + row_offset + local_row) * uniforms.head_size_vec + k + local_col], q_data);
+          inner_qk_values[row_offset + local_row][local_col] += dot(present_key[present_offset + (total_seq_offset + row_offset + local_row) * head_size_vec + k + local_col], q_data);
         }
       }
     }
-    workgroupBarrier();
   }
 #endif
 
@@ -131,6 +158,10 @@ $MAIN {
     for (var i = 0u; i < tile_size_k_vec; i++) {
       sum += inner_qk_values[local_idx][i];
     }
+#if turbo_quant
+    // Apply the deferred scale (L2 norm factored out of the inner loop).
+    sum *= q_element_t(tq_scales[local_idx]);
+#endif
 
     sum = sum + loadAttentionBias(batch_idx, head_idx, 0u, total_seq_offset + local_idx, total_sequence_length);
     tile_qk[local_idx] = sum;

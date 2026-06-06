@@ -47,6 +47,9 @@ const head_size_vec : u32 = head_size / vec_factor;
 // K and V tiles in shared memory.
 var<workgroup> k_tile : array<array<q_value_t, head_size_vec>, max_k_step>;
 var<workgroup> v_tile : array<array<q_value_t, head_size_vec>, max_k_step>;
+#if turbo_quant
+var<workgroup> tq_lut : array<f32, 16>;
+#endif
 
 // Private memory per lane.
 var<private> q_tile : array<q_value_t, head_size_vec>;
@@ -85,10 +88,10 @@ fn loadk(k_start : u32, batch_head_idx : u32, local_idx : u32) {
       let norm = bitcast<f32>(present_key[base]);
       for (var v : u32 = 0u; v < head_size_vec; v++) {
         let elem_base = v * 4u;
-        let c0 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 0u)] * norm;
-        let c1 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 1u)] * norm;
-        let c2 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 2u)] * norm;
-        let c3 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 3u)] * norm;
+        let c0 = tq_lut[tq_extract_index(&present_key, base + 1u, elem_base + 0u)] * norm;
+        let c1 = tq_lut[tq_extract_index(&present_key, base + 1u, elem_base + 1u)] * norm;
+        let c2 = tq_lut[tq_extract_index(&present_key, base + 1u, elem_base + 2u)] * norm;
+        let c3 = tq_lut[tq_extract_index(&present_key, base + 1u, elem_base + 3u)] * norm;
         k_tile[slot][v] = q_value_t(q_element_t(c0), q_element_t(c1), q_element_t(c2), q_element_t(c3));
       }
     } else {
@@ -120,10 +123,10 @@ fn loadv(v_start : u32, batch_head_idx : u32, local_idx : u32) {
       let norm = bitcast<f32>(present_value[base]);
       for (var v : u32 = 0u; v < head_size_vec; v++) {
         let elem_base = v * 4u;
-        let c0 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 0u)] * norm;
-        let c1 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 1u)] * norm;
-        let c2 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 2u)] * norm;
-        let c3 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 3u)] * norm;
+        let c0 = tq_lut[tq_extract_index(&present_value, base + 1u, elem_base + 0u)] * norm;
+        let c1 = tq_lut[tq_extract_index(&present_value, base + 1u, elem_base + 1u)] * norm;
+        let c2 = tq_lut[tq_extract_index(&present_value, base + 1u, elem_base + 2u)] * norm;
+        let c3 = tq_lut[tq_extract_index(&present_value, base + 1u, elem_base + 3u)] * norm;
         v_tile[slot][v] = q_value_t(q_element_t(c0), q_element_t(c1), q_element_t(c2), q_element_t(c3));
       }
     } else {
@@ -180,10 +183,10 @@ fn loadk(k_start : u32, batch_head_idx : u32, local_idx : u32, k_step : u32) {
       let norm = bitcast<f32>(present_key[base]);
       for (var v : u32 = 0u; v < head_size_vec; v++) {
         let elem_base = v * 4u;
-        let c0 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 0u)] * norm;
-        let c1 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 1u)] * norm;
-        let c2 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 2u)] * norm;
-        let c3 = TQ_CENTROIDS[tq_extract_index(&present_key, base + 1u, elem_base + 3u)] * norm;
+        let c0 = tq_lut[tq_extract_index(&present_key, base + 1u, elem_base + 0u)] * norm;
+        let c1 = tq_lut[tq_extract_index(&present_key, base + 1u, elem_base + 1u)] * norm;
+        let c2 = tq_lut[tq_extract_index(&present_key, base + 1u, elem_base + 2u)] * norm;
+        let c3 = tq_lut[tq_extract_index(&present_key, base + 1u, elem_base + 3u)] * norm;
         k_tile[slot][v] = q_value_t(q_element_t(c0), q_element_t(c1), q_element_t(c2), q_element_t(c3));
       }
     } else {
@@ -215,10 +218,10 @@ fn loadv(v_start : u32, batch_head_idx : u32, local_idx : u32, v_step : u32) {
       let norm = bitcast<f32>(present_value[base]);
       for (var v : u32 = 0u; v < head_size_vec; v++) {
         let elem_base = v * 4u;
-        let c0 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 0u)] * norm;
-        let c1 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 1u)] * norm;
-        let c2 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 2u)] * norm;
-        let c3 = TQ_CENTROIDS[tq_extract_index(&present_value, base + 1u, elem_base + 3u)] * norm;
+        let c0 = tq_lut[tq_extract_index(&present_value, base + 1u, elem_base + 0u)] * norm;
+        let c1 = tq_lut[tq_extract_index(&present_value, base + 1u, elem_base + 1u)] * norm;
+        let c2 = tq_lut[tq_extract_index(&present_value, base + 1u, elem_base + 2u)] * norm;
+        let c3 = tq_lut[tq_extract_index(&present_value, base + 1u, elem_base + 3u)] * norm;
         v_tile[slot][v] = q_value_t(q_element_t(c0), q_element_t(c1), q_element_t(c2), q_element_t(c3));
       }
     } else {
@@ -316,6 +319,13 @@ $MAIN {
   if (batch_idx >= uniforms.batch_size) {
     return;
   }
+
+#if turbo_quant
+  // Load centroid LUT into shared memory once. The workgroupBarrier before loadk/loadv synchronizes.
+  if (local_idx < 16u) {
+    tq_lut[local_idx] = TQ_CENTROIDS[local_idx];
+  }
+#endif
 
   // Load Q
   let q_idx_global = (workgroup_idx % uniforms.num_seq_tile) * workgroup_size_x + local_idx;
